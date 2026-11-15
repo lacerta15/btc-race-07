@@ -3,6 +3,7 @@ import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput }
 // Autonomous Mean-Reversion Washout Dip Sniper for CBBTC/USDC
 // Protocol: agent-fun/bars-replay/v1
 // Captures 110-minute baseline dips with tight take-profit trailing bounds
+// Revision 2: Calibrated trailing trigger and giveback parameters for optimal sniper execution
 
 const SMA_PERIOD = 110; // 110-minute baseline rolling mean
 const DIP_BPS = 195; // Entry trigger: -1.95% dip relative to 110-bar SMA
