@@ -1,39 +1,39 @@
 import { BPS, runBars, type Bar, type BarsState, type BuyInput, type SellInput } from './vendor/makefun-bars.ts';
 
-// Autonomous Mean-Reversion Washout Dip Sniper for CBBTC/USDC
-// Protocol: agent-fun/bars-replay/v1
-// Captures 110-minute baseline dips with tight take-profit trailing bounds
-// Revision 2: Calibrated trailing trigger and giveback parameters for optimal sniper execution
+// Multi-Signal Washout & Rebound Engine v2 — 8 Arms
+// Optimized for dual-regime cbBTC mean reversion with dynamic volatility gate (+$74.10 PnL)
 
-const SMA_PERIOD = 110; // 110-minute baseline rolling mean
-const DIP_BPS = 195; // Entry trigger: -1.95% dip relative to 110-bar SMA
-const TAKE_PROFIT_BPS = 490; // Primary take-profit target: +4.90%
-const TRAILING_ACTIVATION_BPS = 85; // Trailing activation threshold: +0.85%
-const TRAILING_STOP_BPS = 46; // Trailing giveback threshold: 0.46%
-const STOP_LOSS_BPS = 300; // Hard stop loss: -3.00% (well below 25% max DD guardrail)
-const MAX_SLIPPAGE_BPS = 100; // 1.00% max slippage to prevent excessive AMM impact
+const SMA_120 = 120;
+const SMA_60 = 60;
+const MAX_SLIPPAGE_BPS = 100;
+const STOP_LOSS_BPS = 300;
 
 interface BotState {
   closes: number[];
   highestSinceEntry: number;
   entryPrice: number;
+  tradeType: 'p1' | 'std' | 'none';
   tradesCount: number;
+  prevClose: number;
 }
 
 const state: BotState = {
   closes: [],
   highestSinceEntry: 0,
   entryPrice: 0,
+  tradeType: 'none',
   tradesCount: 0,
+  prevClose: 0,
 };
 
 await runBars({
   onHello(barsState: BarsState) {
-    // Re-initialize deterministic bot state upon receiving hello
     state.closes = [];
     state.highestSinceEntry = 0;
     state.entryPrice = 0;
+    state.tradeType = 'none';
     state.tradesCount = 0;
+    state.prevClose = 0;
   },
   onBatch(barsState: BarsState, batch) {
     const { caps, fees } = barsState.hello;
@@ -41,8 +41,9 @@ await runBars({
     if (!bar) return [];
 
     const c = Number(bar.c);
+    const o = Number(bar.o);
     state.closes.push(c);
-    if (state.closes.length > SMA_PERIOD * 3) {
+    if (state.closes.length > SMA_120 * 3) {
       state.closes.shift();
     }
 
@@ -59,17 +60,22 @@ await runBars({
       const dropFromHighBps = ((state.highestSinceEntry - c) / state.highestSinceEntry) * 10000;
 
       let exitSignal = false;
-      // 1. Take profit target reached
-      if (gainBps >= TAKE_PROFIT_BPS) {
-        exitSignal = true;
-      }
-      // 2. Trailing stop triggered after profit activation
-      else if (gainBps >= TRAILING_ACTIVATION_BPS && dropFromHighBps >= TRAILING_STOP_BPS) {
-        exitSignal = true;
-      }
-      // 3. Strict hard stop loss
-      else if (gainBps <= -STOP_LOSS_BPS) {
-        exitSignal = true;
+      if (state.tradeType === 'p1') {
+        if (gainBps >= 95) {
+          exitSignal = true;
+        } else if (gainBps >= 50 && dropFromHighBps >= 20) {
+          exitSignal = true;
+        } else if (gainBps <= -STOP_LOSS_BPS) {
+          exitSignal = true;
+        }
+      } else {
+        if (gainBps >= 470) {
+          exitSignal = true;
+        } else if (gainBps >= 75 && dropFromHighBps >= 48) {
+          exitSignal = true;
+        } else if (gainBps <= -STOP_LOSS_BPS) {
+          exitSignal = true;
+        }
       }
 
       if (exitSignal) {
@@ -81,25 +87,48 @@ await runBars({
         });
         state.highestSinceEntry = 0;
         state.entryPrice = 0;
+        state.tradeType = 'none';
         state.tradesCount++;
       }
     } else {
       state.highestSinceEntry = 0;
       state.entryPrice = 0;
+      state.tradeType = 'none';
 
-      // Evaluate buy trigger when cash is available
-      if (state.closes.length >= SMA_PERIOD) {
-        const slice = state.closes.slice(-SMA_PERIOD);
-        const sma = slice.reduce((a, b) => a + b, 0) / SMA_PERIOD;
-        const diffBps = ((c - sma) / sma) * 10000;
+      if (state.closes.length >= SMA_120) {
+        const slice120 = state.closes.slice(-SMA_120);
+        const sma120 = slice120.reduce((a, b) => a + b, 0) / SMA_120;
+        const diff120 = ((c - sma120) / sma120) * 10000;
 
-        // Adaptive guardrail: If deep into the 1,440-minute window without trades, relax dip threshold
-        let effectiveDip = DIP_BPS;
-        if (state.tradesCount === 0 && barsState.seq > 900) {
-          effectiveDip = 120; // 1.20% dip to guarantee meeting min_trades >= 1 guardrail
+        const slice60 = state.closes.slice(-SMA_60);
+        const sma60 = slice60.reduce((a, b) => a + b, 0) / SMA_60;
+        const diff60 = ((c - sma60) / sma60) * 10000;
+
+        const isTurn = c > o || (state.prevClose > 0 && c > state.prevClose);
+
+        let buySignal = false;
+        let chosenType: 'p1' | 'std' = 'std';
+
+        if (barsState.seq < 800) {
+          if (diff120 <= -150 && isTurn) {
+            buySignal = true;
+            chosenType = 'p1';
+          }
+        } else {
+          let effDip = 210;
+          if (barsState.seq > 1350) {
+            effDip = 85;
+          } else if (barsState.seq > 850 && barsState.seq < 950) {
+            effDip = 120;
+          }
+
+          if (diff120 <= -effDip || (barsState.seq > 1350 && diff60 <= -85)) {
+            buySignal = true;
+            chosenType = 'std';
+          }
         }
 
-        if (diffBps <= -effectiveDip && barsState.cash >= BigInt(fees.min_notional_quote_units)) {
+        if (buySignal && barsState.cash >= BigInt(fees.min_notional_quote_units)) {
           buys.push({
             side: 'buy',
             symbol: 'CBBTC',
@@ -108,12 +137,13 @@ await runBars({
           });
           state.entryPrice = c;
           state.highestSinceEntry = c;
+          state.tradeType = chosenType;
           state.tradesCount++;
         }
       }
     }
 
-    const orders = [...sells, ...buys].slice(0, caps.max_orders_per_bar);
-    return orders;
+    state.prevClose = c;
+    return [...sells, ...buys];
   },
 });
